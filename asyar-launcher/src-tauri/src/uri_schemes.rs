@@ -374,6 +374,9 @@ pub fn handle_icon_request(
             tauri::http::Response::builder()
                 .header("Content-Type", content_type)
                 .header("Access-Control-Allow-Origin", "*")
+                // Icons are regenerated under the same filename; make the
+                // webview revalidate instead of serving a stale copy.
+                .header("Cache-Control", "no-cache")
                 .body(bytes)
                 .unwrap()
         }

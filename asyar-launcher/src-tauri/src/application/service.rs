@@ -935,7 +935,45 @@ pub(crate) fn extract_bundle_id(path: &Path) -> Option<String> {
     }
 }
 
+/// How long a "no icon found" marker suppresses re-extraction.
+const MISSING_MARKER_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Bump to discard every cached icon once. v2: Windows `.lnk` icons cached the
+/// shell's generic placeholder while a shortcut target was mid-update.
+const ICON_CACHE_VERSION: &str = "2";
+const ICON_CACHE_VERSION_FILE: &str = ".version";
+
+/// Deletes cached shortcut icons (`*.lnk.png`) and negative markers when the
+/// cache was written by an older extraction scheme. Filenames are
+/// deterministic, so the next sync regenerates them under the same URLs and
+/// stored index entries stay valid. Other icons are left alone: clipboard
+/// history references source-app icons from this directory and only
+/// regenerates them on a new capture.
+fn purge_stale_icon_cache(cache_dir: &Path) {
+    let version_file = cache_dir.join(ICON_CACHE_VERSION_FILE);
+    if std::fs::read_to_string(&version_file).is_ok_and(|v| v.trim() == ICON_CACHE_VERSION) {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.ends_with(".lnk.png") || name.ends_with(".missing") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(version_file, ICON_CACHE_VERSION);
+}
+
 fn get_icon_cache_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> PathBuf {
+    let dir = resolve_icon_cache_dir(app);
+    purge_stale_icon_cache(&dir);
+    dir
+}
+
+fn resolve_icon_cache_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> PathBuf {
     app.path()
         .app_data_dir()
         .map(|p| p.join("icon_cache"))
@@ -986,9 +1024,18 @@ pub(crate) fn extract_app_icon(app_path: &str, cache_dir: &Path) -> Option<Strin
         return Some(format!("asyar-icon://localhost/{}", cache_filename_svg));
     }
 
+    // A negative result is only trusted for a while: the target may simply have
+    // been mid-install (e.g. a package manager swapping directories) when we
+    // looked, and a permanent marker would hide the app's icon forever.
     let missing_marker = cache_dir.join(format!("{base_name}.missing"));
-    if missing_marker.exists() {
-        return None;
+    if let Ok(modified) = std::fs::metadata(&missing_marker).and_then(|m| m.modified()) {
+        let fresh = modified
+            .elapsed()
+            .map(|age| age < MISSING_MARKER_TTL)
+            .unwrap_or(true);
+        if fresh {
+            return None;
+        }
     }
 
     if let Some(bytes) = crate::platform::extract_icon(Path::new(app_path)) {
@@ -1008,7 +1055,9 @@ pub(crate) fn extract_app_icon(app_path: &str, cache_dir: &Path) -> Option<Strin
 
     // Cache the negative result so future launches skip expensive filesystem scans
     let _ = std::fs::create_dir_all(cache_dir);
-    let _ = std::fs::File::create(&missing_marker);
+    // `create` truncates but does not bump the mtime of an existing empty file
+    // on every platform, so write a byte to refresh the TTL clock.
+    let _ = std::fs::write(&missing_marker, b"0");
 
     None
 }
@@ -1895,6 +1944,58 @@ mod tests {
         // Subsequent call immediately returns None via marker check
         let result2 = extract_app_icon("/nonexistent/path/app.desktop", &cache_dir);
         assert!(result2.is_none());
+    }
+
+    #[test]
+    fn test_stale_missing_marker_is_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("icon_cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let marker = cache_dir.join("_nonexistent_path_app.missing");
+        std::fs::write(&marker, b"0").unwrap();
+        // Fresh marker: short-circuits without touching it.
+        assert!(extract_app_icon("/nonexistent/path/app.desktop", &cache_dir).is_none());
+
+        // Age the marker past the TTL; the retry fails again and rewrites it.
+        let old = std::time::SystemTime::now() - MISSING_MARKER_TTL * 2;
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(extract_app_icon("/nonexistent/path/app.desktop", &cache_dir).is_none());
+        let age = std::fs::metadata(&marker)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age < MISSING_MARKER_TTL, "retry must refresh the marker");
+    }
+
+    #[test]
+    fn test_purge_stale_icon_cache_removes_shortcut_icons_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("a.lnk.png"), b"x").unwrap();
+        std::fs::write(dir.join("b.missing"), b"0").unwrap();
+        std::fs::write(dir.join("c_exe.png"), b"x").unwrap();
+
+        purge_stale_icon_cache(dir);
+        assert!(!dir.join("a.lnk.png").exists());
+        assert!(!dir.join("b.missing").exists());
+        assert!(dir.join("c_exe.png").exists(), "non-shortcut icons survive");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(ICON_CACHE_VERSION_FILE)).unwrap(),
+            ICON_CACHE_VERSION
+        );
+
+        // Same version: later icons are not purged again.
+        std::fs::write(dir.join("d.lnk.png"), b"x").unwrap();
+        purge_stale_icon_cache(dir);
+        assert!(dir.join("d.lnk.png").exists());
     }
 
     #[test]
